@@ -1,4 +1,4 @@
-"""Exercise the chat route, Hugging Face client and validation without a model."""
+"""Exercise the chat route and native Ollama requests without a running model."""
 
 import json
 import sqlite3
@@ -7,25 +7,23 @@ from contextlib import contextmanager
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
-from huggingface_hub import InferenceClient
 
+from app.model_config import LLMConfig
 from app.database import init_db
 from app.main import app, get_llm_client, repository
 
 
 def provider_response(text, *, finish_reason="stop", refusal=False):
     return {
-        "id": "completion_test",
-        "object": "chat.completion",
-        "created": 0,
         "model": "test-model",
-        "choices": [{
-            "index": 0,
-            "finish_reason": finish_reason,
-            "message": {"role": "assistant", "content": None if refusal else text},
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        "message": {"role": "assistant", "content": None if refusal else text},
+        "done": True,
+        "done_reason": finish_reason,
     }
+
+
+def answer_response(text, **kwargs):
+    return provider_response(json.dumps({"answer": text}), **kwargs)
 
 
 def parsed_query(**overrides):
@@ -64,8 +62,8 @@ def chat_client(monkeypatch, tmp_path):
     replies = []
 
     def handle(request):
-        assert str(request.url) == "http://test-server/v1/chat/completions"
-        assert request.headers["Authorization"] == "Bearer local"
+        assert str(request.url) == "http://test-server/api/chat"
+        assert "Authorization" not in request.headers
         requests.append(json.loads(request.content))
         assert replies, "Unexpected extra model request"
         reply = replies.pop(0)
@@ -75,9 +73,7 @@ def chat_client(monkeypatch, tmp_path):
             return httpx2.Response(reply[0], json=reply[1])
         return httpx2.Response(200, json=reply)
 
-    with httpx2.Client(transport=httpx2.MockTransport(handle)) as session:
-        monkeypatch.setattr("huggingface_hub.inference._client.get_session", lambda: session)
-        provider = InferenceClient(base_url="http://test-server/v1", token="local")
+    with httpx2.Client(base_url="http://test-server", transport=httpx2.MockTransport(handle)) as provider:
         app.dependency_overrides[get_llm_client] = lambda: provider
         try:
             with TestClient(app) as client:
@@ -91,7 +87,7 @@ def test_chat_resolves_history_retrieves_movies_and_generates_answer(chat_client
     client, replies, requests = chat_client
     replies.extend([
         parsed_query(sort_by="rating"),
-        provider_response("Inception (2010) is a Christopher Nolan dream heist film."),
+        answer_response("Inception (2010) is a Christopher Nolan dream heist film."),
     ])
     history = [
         {"role": "user", "content": "Show highly rated Christopher Nolan movies"},
@@ -114,8 +110,12 @@ def test_chat_resolves_history_retrieves_movies_and_generates_answer(chat_client
     evidence = json.loads(requests[1]["messages"][-1]["content"])
     assert evidence == {"question": message, "retrieved_movies": body["movies"]}
     assert all(request["model"] == "test-model" for request in requests)
-    assert all(request["reasoning_effort"] == "none" for request in requests)
-    assert requests[0]["response_format"] == {"type": "json_object"}
+    assert all(request["think"] is False for request in requests)
+    assert all(request["stream"] is False for request in requests)
+    assert "MovieQuery" in requests[0]["format"]["$defs"]
+    assert requests[1]["format"]["required"] == ["answer"]
+    assert all(request["options"]["temperature"] == 0.7 for request in requests)
+    assert all(request["options"]["top_p"] == 0.8 for request in requests)
     assert '"MovieQuery"' in requests[0]["messages"][0]["content"]
 
 
@@ -129,6 +129,35 @@ def test_no_matches_skips_answer_generation(chat_client):
     assert response.json()["movies"] == []
     assert "couldn't find" in response.json()["answer"]
     assert len(requests) == 1
+
+
+def test_valid_unwrapped_query_is_accepted(chat_client):
+    client, replies, _ = chat_client
+    # Regression: Qwen returned this shape for "Tell me about inception."
+    replies.extend([
+        provider_response(json.dumps({
+            "intent": "details", "title": "inception", "genre": None,
+            "director": None, "year": None, "sort_by": None, "limit": 5,
+        })),
+        answer_response("Inception is a 2010 film directed by Christopher Nolan."),
+    ])
+    response = client.post("/movies/chat", json={
+        "message": "Tell me about inception.",
+        "history": [{"role": "user", "content": "string"}],
+    })
+    assert response.status_code == 200
+    assert response.json()["movies"][0]["title"] == "Inception"
+    assert response.json()["answer"] == "Inception is a 2010 film directed by Christopher Nolan."
+
+
+@pytest.mark.parametrize("prefix", ["<think>Internal text</think>", "Internal text</think>"])
+def test_thinking_text_is_not_returned(chat_client, prefix):
+    client, replies, requests = chat_client
+    replies.extend([parsed_query(), answer_response(prefix + "\nChristopher Nolan directed it.")])
+    response = client.post("/movies/chat", json={"message": "Who directed Inception?"})
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Christopher Nolan directed it."
+    assert all(request["think"] is False for request in requests)
 
 
 def test_unresolved_query_skips_repository_and_generation(chat_client, monkeypatch):
@@ -162,6 +191,9 @@ def test_invalid_chat_request_makes_no_provider_calls(chat_client, payload):
 
 @pytest.mark.parametrize("reply", [
     provider_response("not JSON"),
+    provider_response('{"intent": "search", "limit": 21}'),
+    provider_response('{"intent": "search", "actor": "Unsupported"}'),
+    provider_response('{"intent": "search", "year": "2010"}'),
     parsed_query(limit=21),
     parsed_query(limit="5"),
     parsed_query(intent="unsupported"),
@@ -178,9 +210,13 @@ def test_invalid_query_response_returns_502(chat_client, reply):
 
 
 @pytest.mark.parametrize("reply", [
-    provider_response("   "),
-    provider_response("Partial answer", finish_reason="length"),
+    answer_response("   "),
+    answer_response("Partial answer", finish_reason="length"),
     provider_response("", refusal=True),
+    answer_response("<think>Unfinished internal text"),
+    answer_response("<think>Internal text</think>"),
+    provider_response("not JSON"),
+    provider_response('{"answer": 123}'),
 ])
 def test_invalid_answer_response_returns_502(chat_client, reply):
     client, replies, _ = chat_client
@@ -192,10 +228,11 @@ def test_invalid_answer_response_returns_502(chat_client, reply):
 @pytest.mark.parametrize("during_generation", [False, True])
 @pytest.mark.parametrize("failure, expected_status", [
     ((429, {"error": {"message": "Private provider error", "type": "rate_limit"}}), 502),
+    ((500, {"error": "prediction aborted, token repeat limit reached"}), 502),
     (httpx2.ReadTimeout("Private timeout details"), 504),
     (httpx2.ConnectError("Private connection details"), 503),
 ])
-def test_provider_failures_are_controlled(chat_client, failure, expected_status, during_generation):
+def test_provider_failures_are_controlled(chat_client, caplog, failure, expected_status, during_generation):
     client, replies, _ = chat_client
     if during_generation:
         replies.append(parsed_query())
@@ -203,18 +240,70 @@ def test_provider_failures_are_controlled(chat_client, failure, expected_status,
     response = client.post("/movies/chat", json={"message": "Nolan movies from 2010"})
     assert response.status_code == expected_status
     assert "Private" not in response.text
+    assert len(chat_client[2]) == (2 if during_generation else 1)
+    if isinstance(failure, tuple):
+        assert ("answer generation" if during_generation else "query parsing") in caplog.text
 
 
 def test_default_client_is_local_and_ignores_saved_credentials(monkeypatch):
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.setenv("HF_TOKEN", "hf_must_not_be_used")
-    with contextmanager(get_llm_client)() as client:
-        assert client.model == "http://127.0.0.1:11434/v1"
-        assert client.token == "local"
-        assert client.timeout == 120.0
+    with contextmanager(get_llm_client)(LLMConfig.from_env()) as client:
+        assert str(client.base_url) == "http://127.0.0.1:11434"
+        assert "Authorization" not in client.headers
+        assert client.timeout.read == 120.0
 
 
 def test_client_endpoint_can_be_configured(monkeypatch):
     monkeypatch.setenv("LLM_BASE_URL", "http://localhost:8080/v1")
-    with contextmanager(get_llm_client)() as client:
-        assert client.model == "http://localhost:8080/v1"
+    with contextmanager(get_llm_client)(LLMConfig.from_env()) as client:
+        assert str(client.base_url) == "http://localhost:8080"
+
+
+def test_follow_up_uses_request_history(chat_client):
+    client, replies, requests = chat_client
+    answer = "Inception is a dream heist film directed by Christopher Nolan."
+    replies.extend([parsed_query(), answer_response(answer)])
+    first = client.post("/movies/chat", json={"message": "Tell me about Inception"})
+    assert first.status_code == 200
+
+    replies.extend([parsed_query(), answer_response("It was released in 2010.")])
+    follow_up = client.post("/movies/chat", json={
+        "message": "When was it released?",
+        "history": [
+            {"role": "user", "content": "Tell me about Inception"},
+            {"role": "assistant", "content": first.json()["answer"]},
+        ],
+    })
+
+    assert follow_up.status_code == 200
+    assert set(follow_up.json()) == {"answer", "movies"}
+    assert requests[2]["messages"][1:-1] == [
+        {"role": "user", "content": "Tell me about Inception"},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def test_requests_without_history_are_independent(chat_client):
+    client, replies, requests = chat_client
+    for message in ["Nolan movies", "War movies"]:
+        replies.extend([parsed_query(), answer_response("Inception.")])
+        response = client.post("/movies/chat", json={"message": message})
+        assert response.status_code == 200
+
+    assert requests[2]["messages"][1:] == [{"role": "user", "content": "War movies"}]
+
+
+def test_ten_history_messages_are_accepted(chat_client):
+    client, replies, requests = chat_client
+    replies.append(provider_response('{"query": null}'))
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"Message {index}"}
+        for index in range(10)
+    ]
+    response = client.post("/movies/chat", json={
+        "message": "Tell me more", "history": history,
+    })
+    assert response.status_code == 200
+    assert len(requests) == 1
+    assert requests[0]["messages"][1:-1] == history

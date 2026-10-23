@@ -1,12 +1,13 @@
 """Interpret movie questions and write answers grounded in repository results."""
 
 import json
-import os
 from dataclasses import asdict
 
+import httpx2
 from huggingface_hub import ChatCompletionOutput, InferenceClient
 from pydantic import BaseModel, ConfigDict
 
+from app.model_config import LLMConfig
 from app.repository import MovieRecord
 from app.schemas import ChatMessage, MovieQuery
 
@@ -25,10 +26,16 @@ Explicit sorting excludes movies with fewer than 50 votes. Use limit 5 unless
 requested otherwise, always between 1 and 20.
 
 Available answer facts: title, overview, genres, director, release year, popularity
-and rating. There is no cast, streaming availability or current cinema information.
+and rating. There is no streaming availability or current cinema information.
 Return query=null for unrelated requests, unsupported filters or aggregations,
 or ambiguous references that cannot be resolved from history. Do not silently
 drop unsupported constraints or guess a movie. Broad movie recommendations are OK.
+
+Return exactly one top-level key, "query". For a supported request, nest all movie
+query fields inside it, for example:
+{"query": {"intent": "details", "title": "Inception", "genre": null,
+"director": null, "year": null, "sort_by": null, "limit": 5}}
+For an unsupported request return {"query": null}.
 """
 
 ANSWER_INSTRUCTIONS = """
@@ -45,6 +52,12 @@ class ParsedQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: MovieQuery | None
+
+
+class GeneratedAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
 
 
 class InvalidLLMResponse(ValueError):
@@ -65,18 +78,84 @@ def _completion_text(response: ChatCompletionOutput) -> str:
     if not response.choices:
         raise InvalidLLMResponse("No completion was returned")
     choice = response.choices[0]
-    content = choice.message.content
-    if (
-        choice.finish_reason != "stop"
-        or not isinstance(content, str)
-        or not content.strip()
-    ):
+    if choice.finish_reason != "stop":
         raise InvalidLLMResponse("No complete text was returned")
+    return _final_text(choice.message.content)
+
+
+def _final_text(content: str | None) -> str:
+    if not isinstance(content, str) or not content.strip():
+        raise InvalidLLMResponse("No complete text was returned")
+    # Some Qwen templates omit the opening marker, even with thinking disabled.
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[-1]
+    elif "<think>" in content:
+        raise InvalidLLMResponse("Unfinished thinking block")
+    if not content.strip():
+        raise InvalidLLMResponse("No final answer was returned")
     return content.strip()
 
 
+def _complete(
+    client: InferenceClient | httpx2.Client,
+    config: LLMConfig,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+    temperature: float,
+    schema: dict | None = None,
+) -> str:
+    if isinstance(client, httpx2.Client):
+        # Ollama's native API enforces the schema and explicitly disables thinking.
+        payload = {
+            "model": config.model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_predict": max_tokens,
+                "temperature": temperature,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0,
+            },
+        }
+        if schema is not None:
+            payload["format"] = schema
+        response = client.post("api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if (
+            not isinstance(data, dict)
+            or data.get("done") is not True
+            or data.get("done_reason") != "stop"
+        ):
+            raise InvalidLLMResponse("No complete local response was returned")
+        message = data.get("message")
+        if not isinstance(message, dict):
+            raise InvalidLLMResponse("No local message was returned")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise InvalidLLMResponse("No local text was returned")
+        # Keep structured JSON intact; clean answer text after validating its envelope.
+        return content.strip() if schema is not None else _final_text(content)
+
+    response = client.chat_completion(
+        model=config.model,
+        messages=messages,
+        response_format={"type": "json_object"} if schema is not None else None,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        extra_body=None,
+    )
+    return _completion_text(response)
+
+
 def parse_query(
-    client: InferenceClient, message: str, history: list[ChatMessage]
+    client: InferenceClient | httpx2.Client,
+    message: str,
+    history: list[ChatMessage],
+    config: LLMConfig,
 ) -> MovieQuery | None:
     schema = ParsedQuery.model_json_schema()
     instructions = (
@@ -84,33 +163,51 @@ def parse_query(
         + "\nReturn only a JSON object matching this schema:\n"
         + json.dumps(schema)
     )
-    response = client.chat_completion(
-        model=os.getenv("LLM_MODEL", "qwen3:4b"),
-        messages=_messages(instructions, message, history),
-        # JSON mode is portable across local servers; Pydantic enforces the schema.
-        response_format={"type": "json_object"},
+    content = _complete(
+        client,
+        config,
+        _messages(instructions, message, history),
+        schema=schema,
         max_tokens=512,
-        temperature=0.0,
-        extra_body={"reasoning_effort": "none"},
+        # Qwen recommends sampling, rather than greedy decoding, to avoid loops.
+        temperature=0.7 if config.mode == "local" else 0.0,
     )
-    return ParsedQuery.model_validate_json(_completion_text(response), strict=True).query
+    data = json.loads(content)
+    # Small models may omit the wrapper; accept only a fully valid MovieQuery.
+    if isinstance(data, dict) and "query" not in data:
+        return MovieQuery.model_validate(data, strict=True)
+    return ParsedQuery.model_validate(data, strict=True).query
 
 
 def generate_answer(
-    client: InferenceClient,
+    client: InferenceClient | httpx2.Client,
     message: str,
     history: list[ChatMessage],
     movies: list[MovieRecord],
+    config: LLMConfig,
 ) -> str:
     # Keep retrieved content out of the higher-priority application instructions.
     content = json.dumps(
         {"question": message, "retrieved_movies": [asdict(movie) for movie in movies]}
     )
-    response = client.chat_completion(
-        model=os.getenv("LLM_MODEL", "qwen3:4b"),
-        messages=_messages(ANSWER_INSTRUCTIONS, content, history),
+    instructions = ANSWER_INSTRUCTIONS
+    schema = None
+    if config.mode == "local":
+        schema = GeneratedAnswer.model_json_schema()
+        instructions += (
+            '\nReturn JSON with one key, "answer", containing only the final answer '
+            'in at most three sentences. Do not include analysis or planning.\n'
+            + json.dumps(schema)
+        )
+    result = _complete(
+        client,
+        config,
+        _messages(instructions, content, history),
+        schema=schema,
         max_tokens=1000,
-        temperature=0.3,
-        extra_body={"reasoning_effort": "none"},
+        temperature=0.7 if config.mode == "local" else 0.3,
     )
-    return _completion_text(response)
+    if config.mode == "local":
+        answer = GeneratedAnswer.model_validate_json(result, strict=True).answer
+        return _final_text(answer)
+    return result
