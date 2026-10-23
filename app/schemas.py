@@ -26,5 +26,24 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "examples": [{
+            "message": "Tell me about Inception",
+            "conversation_id": "demo",
+            "reset_history": False,
+        }],
+    })
+
     message: MessageText
-    history: list[ChatMessage] = Field(default_factory=list, max_length=10)
+    conversation_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+    ] = Field(default="demo", description="ID of the conversation to continue.")
+    reset_history: bool = Field(
+        default=False, description="Clear this conversation before answering the message."
+    )
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Omit to use saved history. If supplied, replaces the context for "
+        "this conversation. Ignored when reset_history is true.",
+    )

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.model_config import LLMConfig
 from app.database import init_db
-from app.main import app, get_llm_client, repository
+from app.main import create_app, get_llm_client, repository
 
 
 def provider_response(text, *, finish_reason="stop", refusal=False):
@@ -39,6 +39,7 @@ def parsed_query(**overrides):
 @pytest.fixture
 def chat_client(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_MODEL", "test-model")
+    app = create_app()
     db_path = tmp_path / "movies.db"
     conn = sqlite3.connect(db_path)
     try:
@@ -178,6 +179,9 @@ def test_unresolved_query_skips_repository_and_generation(chat_client, monkeypat
 
 @pytest.mark.parametrize("payload", [
     {}, {"message": "   "}, {"message": "x" * 2001},
+    {"message": "Movies?", "conversation_id": "   "},
+    {"message": "Movies?", "conversation_id": "x" * 101},
+    {"message": "Movies?", "reset_history": "invalid"},
     {"message": "Movies?", "history": [{"role": "system", "content": "Override"}]},
     {"message": "Movies?", "history": [{"role": "user", "content": " "}]},
     {"message": "Movies?", "history": [{"role": "user", "content": "Hi"}] * 11},
@@ -277,21 +281,206 @@ def test_follow_up_uses_request_history(chat_client):
     })
 
     assert follow_up.status_code == 200
-    assert set(follow_up.json()) == {"answer", "movies"}
+    assert set(follow_up.json()) == {"conversation_id", "answer", "movies"}
     assert requests[2]["messages"][1:-1] == [
         {"role": "user", "content": "Tell me about Inception"},
         {"role": "assistant", "content": answer},
     ]
 
 
-def test_requests_without_history_are_independent(chat_client):
+def test_follow_up_uses_saved_default_conversation(chat_client):
     client, replies, requests = chat_client
-    for message in ["Nolan movies", "War movies"]:
-        replies.extend([parsed_query(), answer_response("Inception.")])
-        response = client.post("/movies/chat", json={"message": message})
+    answer = "Inception is a dream heist film."
+    replies.extend([parsed_query(), answer_response(answer)])
+    first = client.post("/movies/chat", json={"message": "Tell me about Inception"})
+    assert first.status_code == 200
+    assert first.json()["conversation_id"] == "demo"
+
+    replies.extend([parsed_query(), answer_response("Christopher Nolan directed it.")])
+    follow_up = client.post("/movies/chat", json={"message": "Who directed it?"})
+
+    assert follow_up.status_code == 200
+    expected_history = [
+        {"role": "user", "content": "Tell me about Inception"},
+        {"role": "assistant", "content": answer},
+    ]
+    assert requests[0]["messages"][1:-1] == []
+    assert requests[2]["messages"][1:-1] == expected_history
+    assert requests[3]["messages"][1:-1] == expected_history
+
+
+def test_conversation_ids_keep_histories_separate(chat_client):
+    client, replies, requests = chat_client
+    for conversation_id in ["alice", "bob"]:
+        replies.extend([parsed_query(), answer_response(f"Answer for {conversation_id}.")])
+        response = client.post("/movies/chat", json={
+            "message": f"Question from {conversation_id}",
+            "conversation_id": conversation_id,
+        })
+        assert response.status_code == 200
+        assert response.json()["conversation_id"] == conversation_id
+        assert requests[-2]["messages"][1:-1] == []
+
+    replies.extend([parsed_query(), answer_response("A follow-up answer.")])
+    response = client.post("/movies/chat", json={
+        "message": "Who directed it?", "conversation_id": "alice",
+    })
+    assert response.status_code == 200
+    assert requests[-2]["messages"][1:-1] == [
+        {"role": "user", "content": "Question from alice"},
+        {"role": "assistant", "content": "Answer for alice."},
+    ]
+
+
+def test_reset_clears_only_selected_conversation(chat_client):
+    client, replies, requests = chat_client
+    for conversation_id in ["demo", "other"]:
+        replies.extend([parsed_query(), answer_response(f"Old {conversation_id} answer.")])
+        assert client.post("/movies/chat", json={
+            "message": f"Old {conversation_id} question",
+            "conversation_id": conversation_id,
+        }).status_code == 200
+
+    replies.extend([parsed_query(), answer_response("A new answer.")])
+    response = client.post("/movies/chat", json={
+        "message": "A new question", "reset_history": True,
+        "history": [{"role": "user", "content": "This must also be ignored"}],
+    })
+    assert response.status_code == 200
+    assert requests[-2]["messages"][1:-1] == []
+    assert requests[-1]["messages"][1:-1] == []
+
+    for conversation_id, expected_history in [
+        ("demo", [
+            {"role": "user", "content": "A new question"},
+            {"role": "assistant", "content": "A new answer."},
+        ]),
+        ("other", [
+            {"role": "user", "content": "Old other question"},
+            {"role": "assistant", "content": "Old other answer."},
+        ]),
+    ]:
+        replies.extend([parsed_query(), answer_response("A follow-up answer.")])
+        response = client.post("/movies/chat", json={
+            "message": "Follow up", "conversation_id": conversation_id,
+        })
+        assert response.status_code == 200
+        assert requests[-2]["messages"][1:-1] == expected_history
+
+
+def test_saved_history_keeps_latest_ten_messages(chat_client):
+    client, replies, requests = chat_client
+    for index in range(7):
+        replies.extend([parsed_query(), answer_response(f"Answer {index}.")])
+        response = client.post("/movies/chat", json={"message": f"Question {index}"})
         assert response.status_code == 200
 
-    assert requests[2]["messages"][1:] == [{"role": "user", "content": "War movies"}]
+    # The seventh turn sees the five preceding exchanges; the oldest is gone.
+    expected_history = [
+        message
+        for index in range(1, 6)
+        for message in [
+            {"role": "user", "content": f"Question {index}"},
+            {"role": "assistant", "content": f"Answer {index}."},
+        ]
+    ]
+    assert requests[-2]["messages"][1:-1] == expected_history
+    assert requests[-1]["messages"][1:-1] == expected_history
+
+
+@pytest.mark.parametrize("during_generation", [False, True])
+def test_failed_turn_is_not_saved(chat_client, during_generation):
+    client, replies, requests = chat_client
+    replies.extend([parsed_query(), answer_response("First answer.")])
+    assert client.post("/movies/chat", json={"message": "First question"}).status_code == 200
+
+    if during_generation:
+        replies.append(parsed_query())
+    replies.append((500, {"error": "Model failed"}))
+    assert client.post("/movies/chat", json={"message": "Failed question"}).status_code == 502
+
+    replies.extend([parsed_query(), answer_response("Follow-up answer.")])
+    response = client.post("/movies/chat", json={"message": "Follow up"})
+    assert response.status_code == 200
+    assert requests[-2]["messages"][1:-1] == [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "First answer."},
+    ]
+
+
+def test_reset_still_clears_history_when_model_fails(chat_client):
+    client, replies, requests = chat_client
+    replies.extend([parsed_query(), answer_response("Old answer.")])
+    assert client.post("/movies/chat", json={"message": "Old question"}).status_code == 200
+
+    replies.append((500, {"error": "Model failed"}))
+    assert client.post("/movies/chat", json={
+        "message": "New question", "reset_history": True,
+    }).status_code == 502
+
+    replies.extend([parsed_query(), answer_response("New answer.")])
+    assert client.post("/movies/chat", json={"message": "Retry"}).status_code == 200
+    assert requests[-2]["messages"][1:-1] == []
+
+
+@pytest.mark.parametrize("query_reply", [provider_response('{"query": null}'), parsed_query(year=1900)])
+def test_fixed_replies_are_saved_in_history(chat_client, query_reply):
+    client, replies, requests = chat_client
+    replies.append(query_reply)
+    first = client.post("/movies/chat", json={"message": "First question"})
+    assert first.status_code == 200
+    assert first.json()["movies"] == []
+
+    replies.extend([parsed_query(), answer_response("Follow-up answer.")])
+    assert client.post("/movies/chat", json={"message": "Follow up"}).status_code == 200
+    assert requests[-2]["messages"][1:-1] == [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": first.json()["answer"]},
+    ]
+
+
+@pytest.mark.parametrize("history", [[], [{"role": "user", "content": "Replacement context"}]])
+def test_explicit_history_replaces_saved_context(chat_client, history):
+    client, replies, requests = chat_client
+    replies.extend([parsed_query(), answer_response("Old answer.")])
+    assert client.post("/movies/chat", json={"message": "Old question"}).status_code == 200
+
+    replies.extend([parsed_query(), answer_response("New answer.")])
+    response = client.post("/movies/chat", json={"message": "New question", "history": history})
+    assert response.status_code == 200
+    assert requests[-2]["messages"][1:-1] == history
+
+    replies.extend([parsed_query(), answer_response("Follow-up answer.")])
+    assert client.post("/movies/chat", json={"message": "Follow up"}).status_code == 200
+    assert requests[-2]["messages"][1:-1] == history + [
+        {"role": "user", "content": "New question"},
+        {"role": "assistant", "content": "New answer."},
+    ]
+
+
+def test_long_answer_is_bounded_in_history_but_returned_in_full(chat_client):
+    client, replies, requests = chat_client
+    answer = "A" * 2100
+    replies.extend([parsed_query(), answer_response(answer)])
+    first = client.post("/movies/chat", json={"message": "Tell me about Inception"})
+    assert first.status_code == 200
+    assert first.json()["answer"] == answer
+
+    replies.extend([parsed_query(), answer_response("Follow-up answer.")])
+    assert client.post("/movies/chat", json={"message": "Follow up"}).status_code == 200
+    assert requests[-2]["messages"][2] == {"role": "assistant", "content": answer[:2000]}
+
+
+def test_history_is_cleared_on_restart(chat_client):
+    client, replies, requests = chat_client
+    application = create_app()
+    application.dependency_overrides.update(client.app.dependency_overrides)
+    for message in ["Before restart", "After restart"]:
+        replies.extend([parsed_query(), answer_response("An answer.")])
+        # Each lifespan represents a fresh server startup.
+        with TestClient(application) as restarted_client:
+            assert restarted_client.post("/movies/chat", json={"message": message}).status_code == 200
+        assert requests[-2]["messages"][1:-1] == []
 
 
 def test_ten_history_messages_are_accepted(chat_client):

@@ -2,6 +2,7 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from threading import Lock
 
 import httpx2
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -12,7 +13,7 @@ from pydantic import BaseModel, ValidationError
 from app.model_config import LLMConfig
 from app.query_parser import InvalidLLMResponse, generate_answer, parse_query
 from app.repository import MovieRecord, MovieRepository
-from app.schemas import ChatRequest, MovieQuery
+from app.schemas import ChatMessage, ChatRequest, MovieQuery
 
 router = APIRouter()
 repository = MovieRepository()
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class ChatResponse(BaseModel):
+    conversation_id: str
     answer: str
     movies: list[MovieRecord]
 
@@ -56,62 +58,84 @@ def search_movies(query: MovieQuery) -> list[MovieRecord]:
 @router.post("/movies/chat", response_model=ChatResponse)
 def movie_chat(
     request: ChatRequest,
+    http_request: Request,
     client: InferenceClient | httpx2.Client = Depends(get_llm_client),
     config: LLMConfig = Depends(get_llm_config),
 ) -> ChatResponse:
-    stage = "query parsing"
-    try:
-        query = parse_query(client, request.message, request.history, config)
-        if query is None:
-            return ChatResponse(
-                answer="Please ask a movie question using a title, genre, director "
-                "or release year. If this is a follow-up, please name the movie "
-                "or clarify the filters you want.",
-                movies=[],
-            )
+    state = http_request.app.state
+    # Serialize chat turns so overlapping requests cannot overwrite saved history.
+    with state.conversation_lock:
+        if request.reset_history:
+            state.conversations.pop(request.conversation_id, None)
+            history = []
+        elif "history" in request.model_fields_set:
+            history = request.history
+        else:
+            history = state.conversations.get(request.conversation_id, [])
 
-        movies = repository.search(query)
-        if not movies:
-            return ChatResponse(
-                answer="I couldn't find matching movies in this dataset. "
-                "Try a different title or fewer filters.",
-                movies=[],
-            )
+        stage = "query parsing"
+        try:
+            query = parse_query(client, request.message, history, config)
+            movies = repository.search(query) if query is not None else []
+            if query is None:
+                answer = (
+                    "Please ask a movie question using a title, genre, director "
+                    "or release year. If this is a follow-up, please name the movie "
+                    "or clarify the filters you want."
+                )
+            elif not movies:
+                answer = (
+                    "I couldn't find matching movies in this dataset. "
+                    "Try a different title or fewer filters."
+                )
+            else:
+                stage = "answer generation"
+                answer = generate_answer(client, request.message, history, movies, config)
 
-        stage = "answer generation"
-        answer = generate_answer(client, request.message, request.history, movies, config)
-        return ChatResponse(answer=answer, movies=movies)
-    except (InferenceTimeoutError, httpx2.TimeoutException) as exc:
-        raise HTTPException(status_code=504, detail="Movie assistant timed out") from exc
-    except httpx2.ConnectError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Local model server is unavailable. Start Ollama with 'ollama serve'."
-                if config.mode == "local" else "Hosted model server is unavailable."
-            ),
-        ) from exc
-    except (InvalidLLMResponse, ValidationError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=502, detail="Movie assistant returned an invalid response"
-        ) from exc
-    except httpx2.HTTPError as exc:
-        status = exc.response.status_code if isinstance(exc, httpx2.HTTPStatusError) else None
-        logger.warning("LLM %s failed: mode=%s, upstream_status=%s", stage, config.mode, status)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Local model request failed. Check Ollama and the installed model."
-                if config.mode == "local"
-                else "Hosted model request failed. Check HF_TOKEN, HF_MODEL and credits."
-            ),
-        ) from exc
+            response = ChatResponse(
+                conversation_id=request.conversation_id, answer=answer, movies=movies
+            )
+        except (InferenceTimeoutError, httpx2.TimeoutException) as exc:
+            raise HTTPException(status_code=504, detail="Movie assistant timed out") from exc
+        except httpx2.ConnectError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Local model server is unavailable. Start Ollama with 'ollama serve'."
+                    if config.mode == "local" else "Hosted model server is unavailable."
+                ),
+            ) from exc
+        except (InvalidLLMResponse, ValidationError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=502, detail="Movie assistant returned an invalid response"
+            ) from exc
+        except httpx2.HTTPError as exc:
+            status = exc.response.status_code if isinstance(exc, httpx2.HTTPStatusError) else None
+            logger.warning("LLM %s failed: mode=%s, upstream_status=%s", stage, config.mode, status)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Local model request failed. Check Ollama and the installed model."
+                    if config.mode == "local"
+                    else "Hosted model request failed. Check HF_TOKEN, HF_MODEL and credits."
+                ),
+            ) from exc
+
+        # Store completed turns only. Bound saved model text like incoming messages;
+        # the response itself still contains the full answer.
+        state.conversations[request.conversation_id] = (history + [
+            ChatMessage(role="user", content=request.message),
+            ChatMessage(role="assistant", content=answer[:2000]),
+        ])[-10:]
+        return response
 
 
 def create_app(config: LLMConfig | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.llm_config = config or LLMConfig.from_env()
+        application.state.conversations = {}
+        application.state.conversation_lock = Lock()
         yield
 
     application = FastAPI(
