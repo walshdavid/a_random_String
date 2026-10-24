@@ -11,3 +11,6 @@ wheels/
 
 # Local credential file
 /APIkey
+
+# Recreated application log
+/log.txt
