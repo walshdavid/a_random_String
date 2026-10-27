@@ -79,6 +79,16 @@ uv run python -m app.main --API
 python -m app.main --API
 ```
 
+### Try it out
+Open http://127.0.0.1:8000/docs to try the API. 
+A sample query is in place. To send a new query, amend the ```message``` value in the request_bdoy dictionary:
+```json
+{
+  "conversation_id": "demo",
+  "message": "What year was Napoleon Dynamite released?",
+  "reset_history": false
+}
+```
+The conversation id allows history to be stored for more than one user. The history has a 10 message limit. 
+To reset a history for a given user, send a new request with ```"reset_history": true```
 
-
-Open http://127.0.0.1:8000/docs to try the API.
