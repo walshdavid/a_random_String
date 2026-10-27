@@ -1,157 +1,86 @@
-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.database import DEFAULT_DB_PATH, ensure_tables
+from app.database import DEFAULT_DB_PATH, get_connection, init_db
 
 MOVIES_CSV = ROOT / "tmdb_5000_movies.csv"
 CREDITS_CSV = ROOT / "tmdb_5000_credits.csv"
 
-MOVIE_COLUMNS = [
-    "budget",
-    "genres",
-    "homepage",
-    "id",
-    "keywords",
-    "original_language",
-    "original_title",
-    "overview",
-    "popularity",
-    "production_companies",
-    "production_countries",
-    "release_date",
-    "revenue",
-    "runtime",
-    "spoken_languages",
-    "status",
-    "tagline",
-    "title",
-    "vote_average",
-    "vote_count",
-]
 
-CREDIT_COLUMNS = ["movie_id", "title", "cast", "crew"]
+def load_movies_csv(path: Path) -> list[dict]:
+    movies = []
+    with path.open(encoding="utf-8", newline="") as csvfile:
+        for row in csv.DictReader(csvfile):
+            release_date = row.get("release_date") or ""
+            movies.append({
+                "id": int(row["id"]),
+                "title": row.get("title") or None,
+                "year": int(release_date[:4]) if release_date else None,
+                "overview": row.get("overview") or None,
+                "genres": [genre["name"] for genre in json.loads(row.get("genres") or "[]")],
+                "keywords": json.dumps([
+                    keyword["name"] for keyword in json.loads(row.get("keywords") or "[]")
+                ]),
+                "popularity": float(row["popularity"]) if row.get("popularity") else None,
+                "vote_average": float(row["vote_average"]) if row.get("vote_average") else None,
+                "vote_count": int(row["vote_count"]) if row.get("vote_count") else None,
+            })
+    return movies
 
 
-def parse_int(value: str | None) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_float(value: str | None) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def clean_text(value: str | None) -> str | None:
-    if value is None or value == "":
-        return None
-    return value
-
-
-def format_json(value: str | None) -> str | None:
-    if value is None or value == "":
-        return None
-    try:
-        return json.dumps(json.loads(value))
-    except (TypeError, ValueError):
-        return value
-
-
-def load_movies_csv(path: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    with path.open("r", encoding="utf-8", newline="") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            normalized = {
-                "budget": parse_int(row.get("budget")),
-                "genres": format_json(row.get("genres")),
-                "homepage": clean_text(row.get("homepage")),
-                "id": parse_int(row.get("id")),
-                "keywords": format_json(row.get("keywords")),
-                "original_language": clean_text(row.get("original_language")),
-                "original_title": clean_text(row.get("original_title")),
-                "overview": clean_text(row.get("overview")),
-                "popularity": parse_float(row.get("popularity")),
-                "production_companies": format_json(row.get("production_companies")),
-                "production_countries": format_json(row.get("production_countries")),
-                "release_date": clean_text(row.get("release_date")),
-                "revenue": parse_int(row.get("revenue")),
-                "runtime": parse_float(row.get("runtime")),
-                "spoken_languages": format_json(row.get("spoken_languages")),
-                "status": clean_text(row.get("status")),
-                "tagline": clean_text(row.get("tagline")),
-                "title": clean_text(row.get("title")),
-                "vote_average": parse_float(row.get("vote_average")),
-                "vote_count": parse_int(row.get("vote_count")),
+def load_credits_csv(path: Path) -> dict[int, dict]:
+    credits = {}
+    with path.open(encoding="utf-8", newline="") as csvfile:
+        for row in csv.DictReader(csvfile):
+            cast = json.loads(row.get("cast") or "[]")
+            crew = json.loads(row.get("crew") or "[]")
+            credits[int(row["movie_id"])] = {
+                "cast": json.dumps([actor["name"] for actor in cast if actor.get("name")]),
+                "director": next(
+                    (person["name"] for person in crew
+                     if person.get("job") == "Director" and person.get("name")),
+                    None,
+                ),
             }
-            rows.append(normalized)
-    return rows
+    return credits
 
 
-def load_credits_csv(path: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    with path.open("r", encoding="utf-8", newline="") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            normalized = {
-                "movie_id": parse_int(row.get("movie_id")),
-                "title": clean_text(row.get("title")),
-                "cast": format_json(row.get("cast")),
-                "crew": format_json(row.get("crew")),
-            }
-            rows.append(normalized)
-    return rows
+def ingest(db_path: Path, movies_csv: Path, credits_csv: Path) -> int:
+    # Read and validate both inputs before replacing the existing database tables.
+    movies = load_movies_csv(movies_csv)
+    credits = load_credits_csv(credits_csv)
 
-
-def insert_movies(conn: sqlite3.Connection, rows: list[dict[str, object]]) -> int:
-    insert_sql = (
-        "INSERT OR REPLACE INTO movies ("
-        + ", ".join(MOVIE_COLUMNS)
-        + ") VALUES ("
-        + ", ".join(["?" for _ in MOVIE_COLUMNS])
-        + ")"
-    )
-    conn.executemany(
-        insert_sql,
-        [tuple(row.get(column) for column in MOVIE_COLUMNS) for row in rows],
-    )
-    conn.commit()
-    return len(rows)
-
-
-def insert_credits(conn: sqlite3.Connection, rows: list[dict[str, object]]) -> int:
-    insert_sql = (
-        "INSERT OR REPLACE INTO credits ("
-        + ", ".join(CREDIT_COLUMNS)
-        + ") VALUES ("
-        + ", ".join(["?" for _ in CREDIT_COLUMNS])
-        + ")"
-    )
-    conn.executemany(
-        insert_sql,
-        [tuple(row.get(column) for column in CREDIT_COLUMNS) for row in rows],
-    )
-    conn.commit()
-    return len(rows)
+    with closing(get_connection(db_path)) as conn, conn:
+        # SQLite otherwise starts transactions only for writes, not schema changes.
+        conn.execute("BEGIN")
+        init_db(conn)
+        for movie in movies:
+            credit = credits.get(movie["id"], {"cast": "[]", "director": None})
+            conn.execute(
+                'INSERT INTO movies (id, title, year, overview, "cast", director, keywords, popularity) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (movie["id"], movie["title"], movie["year"], movie["overview"],
+                 credit["cast"], credit["director"], movie["keywords"], movie["popularity"]),
+            )
+            conn.executemany(
+                "INSERT INTO genres (movie_id, name) VALUES (?, ?)",
+                [(movie["id"], name) for name in dict.fromkeys(movie["genres"])],
+            )
+            conn.execute(
+                "INSERT INTO ratings (movie_id, vote_average, vote_count) VALUES (?, ?, ?)",
+                (movie["id"], movie["vote_average"], movie["vote_count"]),
+            )
+    return len(movies)
 
 
 def main() -> None:
@@ -161,19 +90,9 @@ def main() -> None:
     parser.add_argument("--credits-csv", type=Path, default=CREDITS_CSV, help="Path to tmdb_5000_credits.csv")
     args = parser.parse_args()
 
-    conn = ensure_tables(args.db_path)
-    try:
-        movies_rows = load_movies_csv(args.movies_csv)
-        credits_rows = load_credits_csv(args.credits_csv)
-
-        inserted_movies = insert_movies(conn, movies_rows)
-        inserted_credits = insert_credits(conn, credits_rows)
-
-        print(f"Created database at: {args.db_path}")
-        print(f"Inserted {inserted_movies} movies into movies table")
-        print(f"Inserted {inserted_credits} credits into credits table")
-    finally:
-        conn.close()
+    inserted_movies = ingest(args.db_path, args.movies_csv, args.credits_csv)
+    print(f"Created database at: {args.db_path}")
+    print(f"Inserted {inserted_movies} movies with genres, ratings and credits data")
 
 
 if __name__ == "__main__":
