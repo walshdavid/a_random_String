@@ -58,6 +58,8 @@ class MovieRepository:
             query = MovieQuery.model_validate(query)
         if not isinstance(query, MovieQuery):
             raise TypeError("query must be a MovieQuery instance or mapping")
+        if not query.has_criteria:
+            return []
 
         conditions: list[str] = []
         params: list[Any] = []
@@ -78,6 +80,15 @@ class MovieRepository:
         if query.director:
             conditions.append("LOWER(m.director) LIKE LOWER(?)")
             params.append(f"%{query.director}%")
+
+        if query.cast:
+            escaped = query.cast.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            conditions.append(
+                "EXISTS ("
+                'SELECT 1 FROM json_each(m."cast") AS cast_member '
+                "WHERE LOWER(cast_member.value) LIKE LOWER(?) ESCAPE '!')"
+            )
+            params.append(f"%{escaped}%")
 
         if query.year is not None:
             conditions.append("m.year = ?")

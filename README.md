@@ -16,6 +16,7 @@ With uv installed:
 
 ```bash
 uv sync
+uv run python -m pytest -q
 uv run python scripts/ingest.py
 ```
 
@@ -24,9 +25,10 @@ uv run python scripts/ingest.py
 Alternatively, create and activate a virtual environment:
 
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r req.txt
+python -m pytest -q
 python scripts/ingest.py
 ```
 

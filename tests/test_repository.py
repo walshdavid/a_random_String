@@ -73,7 +73,7 @@ def test_multiple_genres_do_not_duplicate_movies(tmp_path):
     db_path = tmp_path / "movies.db"
     _seed_db(db_path)
 
-    result = MovieRepository(db_path).search(MovieQuery(intent="search"))
+    result = MovieRepository(db_path).search(MovieQuery(intent="search", title="Dunkirk"))
 
     assert [movie.id for movie in result] == [1]
     assert set(result[0].genres) == {"Action", "War"}
@@ -107,7 +107,11 @@ def test_repository_limits_results(tmp_path, limit, expected_count):
         )
 
     repo = MovieRepository(db_path)
-    query = MovieQuery(intent="search") if limit is None else MovieQuery(intent="search", limit=limit)
+    query = (
+        MovieQuery(intent="search", title="Movie")
+        if limit is None
+        else MovieQuery(intent="search", title="Movie", limit=limit)
+    )
     result = repo.search(query)
 
     assert len(result) == expected_count
@@ -183,10 +187,10 @@ def test_vote_threshold_applies_only_with_explicit_sort(
     conn = sqlite3.connect(db_path)
     try:
         conn.executemany(
-            "INSERT INTO movies (id, title, popularity) VALUES (?, ?, ?)",
+            "INSERT INTO movies (id, title, year, popularity) VALUES (?, ?, ?, ?)",
             [
-                (2, "Low vote movie", 100.0),
-                (3, "Boundary movie", 20.0),
+                (2, "Low vote movie", 2017, 100.0),
+                (3, "Boundary movie", 2017, 20.0),
             ],
         )
         conn.executemany(
@@ -198,7 +202,7 @@ def test_vote_threshold_applies_only_with_explicit_sort(
         conn.close()
 
     result = MovieRepository(db_path).search(
-        MovieQuery(intent="search", sort_by=sort_by)
+        MovieQuery(intent="search", year=2017, sort_by=sort_by)
     )
 
     assert [movie.title for movie in result] == expected_titles

@@ -20,7 +20,7 @@ def test_local_is_default_even_with_hosted_credentials(monkeypatch):
     monkeypatch.setenv("HF_MODEL", "example/hosted-model")
     config = LLMConfig.from_env()
     assert config.mode == "local"
-    assert config.model == "qwen3:4b"
+    assert config.model == "gemma3:4b"
     assert config.token == "local"
 
 

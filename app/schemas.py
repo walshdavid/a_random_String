@@ -4,18 +4,26 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class MovieQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     intent: Literal["details", "recommend", "search"]
     title: str | None = None
     genre: str | None = None
     director: str | None = None
+    cast: str | None = None
     year: int | None = None
     keywords: list[
         Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     ] = Field(default_factory=list, max_length=5)
     sort_by: Literal["rating", "popularity"] | None = None
     limit: int = Field(default=20, ge=1, le=50)
+
+    @property
+    def has_criteria(self) -> bool:
+        return any((
+            self.title, self.genre, self.director, self.cast,
+            self.year is not None, self.keywords, self.sort_by,
+        ))
 
 
 MessageText = Annotated[

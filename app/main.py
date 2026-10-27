@@ -59,6 +59,11 @@ def get_llm_client(
 
 @router.post("/movies/search", response_model=list[MovieRecord])
 def search_movies(query: MovieQuery) -> list[MovieRecord]:
+    if not query.has_criteria:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide a title, genre, director, cast member, year, keyword or sort_by.",
+        )
     return repository.search(query)
 
 
@@ -93,6 +98,9 @@ def movie_chat(
                 query.model_dump_json() if query is not None else None,
                 extra={"duration_ms": f"{duration_ms:.1f}"},
             )
+            if query is not None and not query.has_criteria:
+                logger.info("Empty MovieQuery; asking for clarification")
+                query = None
             movies = []
             if query is not None:
                 stage = "database search"
@@ -107,8 +115,8 @@ def movie_chat(
                 )
             if query is None:
                 answer = (
-                    "Please ask a movie question using a title, genre, director "
-                    "or release year, or describe a topic using keywords. "
+                    "Please ask a movie question using a title, genre, director, "
+                    "cast member or release year, or describe a topic using keywords. "
                     "If this is a follow-up, please name the movie "
                     "or clarify the filters you want."
                 )
