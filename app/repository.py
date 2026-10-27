@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import json
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from app.database import DEFAULT_DB_PATH, get_connection
 from app.schemas import MovieQuery
+
+
+def _json_strings(raw: str | None) -> list[str]:
+    try:
+        items = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, str) and item]
 
 
 @dataclass(frozen=True)
@@ -20,28 +30,22 @@ class MovieRecord:
     release_year: int | None
     popularity: float | None
     rating: float | None
+    keywords: list[str] = field(default_factory=list)
+    cast: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "MovieRecord":
-        genres = []
-        raw_genres = row.get("genres")
-        if raw_genres:
-            try:
-                parsed = json.loads(raw_genres)
-            except (TypeError, ValueError):
-                parsed = []
-            if isinstance(parsed, list):
-                genres = [item.get("name", "") for item in parsed if isinstance(item, dict) and item.get("name")]
-
         return cls(
             id=int(row["id"]),
             title=row["title"] or "",
             overview=row.get("overview"),
-            genres=genres,
+            genres=_json_strings(row.get("genres")),
             director=row.get("director"),
             release_year=row.get("release_year"),
             popularity=row.get("popularity"),
             rating=row.get("vote_average"),
+            keywords=_json_strings(row.get("keywords")),
+            cast=_json_strings(row.get("cast")),
         )
 
 
@@ -65,50 +69,54 @@ class MovieRepository:
         if query.genre:
             conditions.append(
                 "EXISTS ("
-                "SELECT 1 FROM json_each(m.genres) AS genre_item "
-                "WHERE LOWER(json_extract(genre_item.value, '$.name')) = LOWER(?)"
+                "SELECT 1 FROM genres AS g "
+                "WHERE g.movie_id = m.id AND LOWER(g.name) = LOWER(?)"
                 ")"
             )
             params.append(query.genre)
 
         if query.director:
-            conditions.append(
-                "EXISTS ("
-                "SELECT 1 FROM json_each(COALESCE(c.crew, '[]')) AS crew_item "
-                "WHERE json_extract(crew_item.value, '$.job') = 'Director' "
-                "AND LOWER(json_extract(crew_item.value, '$.name')) LIKE LOWER(?)"
-                ")"
-            )
+            conditions.append("LOWER(m.director) LIKE LOWER(?)")
             params.append(f"%{query.director}%")
 
         if query.year is not None:
-            conditions.append("CAST(strftime('%Y', m.release_date) AS INTEGER) = ?")
+            conditions.append("m.year = ?")
             params.append(query.year)
 
+        if query.keywords:
+            keyword_conditions = []
+            for keyword in query.keywords:
+                # Search literal text; SQL LIKE wildcards in a keyword are escaped.
+                escaped = keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+                keyword_conditions.append(
+                    "(LOWER(m.overview) LIKE LOWER(?) ESCAPE '!' OR EXISTS ("
+                    "SELECT 1 FROM json_each(COALESCE(m.keywords, '[]')) AS keyword_item "
+                    "WHERE LOWER(keyword_item.value) LIKE LOWER(?) ESCAPE '!'))"
+                )
+                params.extend([f"%{escaped}%", f"%{escaped}%"])
+            conditions.append("(" + " OR ".join(keyword_conditions) + ")")
+
         base_sql = (
-            "SELECT m.id, m.title, m.overview, m.genres, m.popularity, m.vote_average, "
-            "m.release_date, CAST(strftime('%Y', m.release_date) AS INTEGER) AS release_year, "
-            "COALESCE((SELECT json_extract(crew_item.value, '$.name') "
-            "FROM json_each(COALESCE(c.crew, '[]')) AS crew_item "
-            "WHERE json_extract(crew_item.value, '$.job') = 'Director' LIMIT 1), '') AS director "
+            'SELECT m.id, m.title, m.year AS release_year, m.overview, m."cast", '
+            "m.director, m.keywords, m.popularity, r.vote_average, "
+            "(SELECT json_group_array(g.name) FROM genres AS g "
+            "WHERE g.movie_id = m.id) AS genres "
             "FROM movies AS m "
-            "LEFT JOIN credits AS c ON c.movie_id = m.id"
+            "LEFT JOIN ratings AS r ON r.movie_id = m.id"
         )
 
         # Add minimum vote count filter
         if query.sort_by:
-            conditions.append("m.vote_count >= ?")
+            conditions.append("r.vote_count >= ?")
             params.append(50)
 
         if conditions:
             base_sql += " WHERE " + " AND ".join(conditions)
 
         if query.sort_by == "rating":
-            order_by = "ORDER BY m.vote_average DESC, m.popularity DESC"
-        elif query.sort_by == "popularity":
-            order_by = "ORDER BY m.popularity DESC, m.vote_average DESC"
+            order_by = "ORDER BY r.vote_average DESC, m.popularity DESC"
         else:
-            order_by = "ORDER BY m.popularity DESC, m.vote_average DESC"
+            order_by = "ORDER BY m.popularity DESC, r.vote_average DESC"
 
         sql = f"{base_sql} {order_by} LIMIT ?"
         params.append(query.limit)

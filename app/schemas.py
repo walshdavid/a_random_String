@@ -11,8 +11,11 @@ class MovieQuery(BaseModel):
     genre: str | None = None
     director: str | None = None
     year: int | None = None
+    keywords: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    ] = Field(default_factory=list, max_length=5)
     sort_by: Literal["rating", "popularity"] | None = None
-    limit: int = Field(default=5, ge=1, le=20)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 MessageText = Annotated[
