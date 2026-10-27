@@ -23,7 +23,7 @@ class LLMConfig:
 
         return cls(
             mode="local",
-            model=os.getenv("LLM_MODEL", "").strip() or "qwen3:4b",
-            base_url=os.getenv("LLM_BASE_URL", "").strip() or "http://127.0.0.1:11434",
+            model=os.getenv("OLLAMA_MODEL", "").strip() or "qwen3:4b",
+            base_url=os.getenv("OLLAMA_BASE_URL", "").strip() or "http://127.0.0.1:11434",
             token="local",
         )
