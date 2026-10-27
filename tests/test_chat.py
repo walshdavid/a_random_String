@@ -30,7 +30,7 @@ def parsed_query(**overrides):
     query = {
         "intent": "search", "title": None, "genre": None,
         "director": "Christopher Nolan", "year": 2010,
-        "sort_by": None, "limit": 5,
+        "keywords": [], "sort_by": None, "limit": 5,
     }
     query.update(overrides)
     return provider_response(json.dumps({"query": query}))
@@ -38,21 +38,25 @@ def parsed_query(**overrides):
 
 @pytest.fixture
 def chat_client(monkeypatch, tmp_path):
-    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("OLLAMA_MODEL", "test-model")
     app = create_app()
     db_path = tmp_path / "movies.db"
     conn = sqlite3.connect(db_path)
     try:
         init_db(conn)
         conn.execute(
-            "INSERT INTO movies (id, title, genres, overview, release_date, "
-            "vote_average, popularity, vote_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (1, "Inception", '[{"name": "Science Fiction"}]', "A dream heist.",
-             "2010-07-16", 8.1, 20.0, 100),
+            'INSERT INTO movies (id, title, year, overview, "cast", director, popularity) '
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (1, "Inception", 2010, "A dream heist.", '["Leonardo DiCaprio", "Joseph Gordon-Levitt"]',
+             "Christopher Nolan", 20.0),
         )
         conn.execute(
-            "INSERT INTO credits (movie_id, crew) VALUES (?, ?)",
-            (1, '[{"name": "Christopher Nolan", "job": "Director"}]'),
+            "INSERT INTO genres (movie_id, name) VALUES (?, ?)",
+            (1, "Science Fiction"),
+        )
+        conn.execute(
+            "INSERT INTO ratings (movie_id, vote_average, vote_count) VALUES (?, ?, ?)",
+            (1, 8.1, 100),
         )
         conn.commit()
     finally:
@@ -132,6 +136,50 @@ def test_no_matches_skips_answer_generation(chat_client):
     assert len(requests) == 1
 
 
+def test_christmas_keyword_retrieves_movies_and_passes_evidence_to_llm2(chat_client):
+    client, replies, requests = chat_client
+    conn = sqlite3.connect(repository.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO movies (id, title, overview, keywords, popularity) VALUES (?, ?, ?, ?, ?)",
+            (2, "Winter Reunion", "Friends reunite for an annual celebration.",
+             '["christmas"]', 5),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    replies.extend([
+        parsed_query(intent="recommend", director=None, year=None, keywords=["christmas"]),
+        answer_response("Try Winter Reunion, which is tagged with Christmas."),
+    ])
+    response = client.post("/movies/chat", json={"message": "Find me a Christmas movie"})
+
+    assert response.status_code == 200
+    movies = response.json()["movies"]
+    assert [movie["title"] for movie in movies] == ["Winter Reunion"]
+    assert movies[0]["keywords"] == ["christmas"]
+    assert json.loads(requests[1]["messages"][-1]["content"])["retrieved_movies"] == movies
+    keyword_schema = requests[0]["format"]["$defs"]["MovieQuery"]["properties"]["keywords"]
+    assert keyword_schema["type"] == "array"
+
+
+def test_cast_names_are_returned_and_supplied_as_answer_evidence(chat_client):
+    client, replies, requests = chat_client
+    replies.extend([
+        parsed_query(intent="details", title="Inception", director=None, year=None),
+        answer_response("Inception stars Leonardo DiCaprio and Joseph Gordon-Levitt."),
+    ])
+
+    response = client.post("/movies/chat", json={"message": "Who stars in Inception?"})
+
+    assert response.status_code == 200
+    expected_cast = ["Leonardo DiCaprio", "Joseph Gordon-Levitt"]
+    assert response.json()["movies"][0]["cast"] == expected_cast
+    evidence = json.loads(requests[1]["messages"][-1]["content"])
+    assert evidence["retrieved_movies"][0]["cast"] == expected_cast
+
+
 def test_valid_unwrapped_query_is_accepted(chat_client):
     client, replies, _ = chat_client
     # Regression: Qwen returned this shape for "Tell me about inception."
@@ -195,13 +243,17 @@ def test_invalid_chat_request_makes_no_provider_calls(chat_client, payload):
 
 @pytest.mark.parametrize("reply", [
     provider_response("not JSON"),
-    provider_response('{"intent": "search", "limit": 21}'),
+    provider_response('{"intent": "search", "limit": 51}'),
     provider_response('{"intent": "search", "actor": "Unsupported"}'),
     provider_response('{"intent": "search", "year": "2010"}'),
-    parsed_query(limit=21),
+    parsed_query(limit=51),
     parsed_query(limit="5"),
     parsed_query(intent="unsupported"),
     parsed_query(actor="Unsupported filter"),
+    parsed_query(keywords="christmas"),
+    parsed_query(keywords=[" "]),
+    parsed_query(keywords=["x" * 101]),
+    parsed_query(keywords=["christmas"] * 6),
     provider_response("", refusal=True),
     provider_response('{"query": null}', finish_reason="length"),
 ])
@@ -250,7 +302,7 @@ def test_provider_failures_are_controlled(chat_client, caplog, failure, expected
 
 
 def test_default_client_is_local_and_ignores_saved_credentials(monkeypatch):
-    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.setenv("HF_TOKEN", "hf_must_not_be_used")
     with contextmanager(get_llm_client)(LLMConfig.from_env()) as client:
         assert str(client.base_url) == "http://127.0.0.1:11434"
@@ -259,7 +311,7 @@ def test_default_client_is_local_and_ignores_saved_credentials(monkeypatch):
 
 
 def test_client_endpoint_can_be_configured(monkeypatch):
-    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:8080/v1")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:8080/v1")
     with contextmanager(get_llm_client)(LLMConfig.from_env()) as client:
         assert str(client.base_url) == "http://localhost:8080"
 

@@ -15,53 +15,27 @@ def _seed_db(db_path):
     conn.execute(
         """
         INSERT INTO movies (
-            budget, genres, homepage, id, keywords, original_language,
-            original_title, overview, popularity, production_companies,
-            production_countries, release_date, revenue, runtime,
-            spoken_languages, status, tagline, title, vote_average, vote_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, title, year, overview, cast, director, keywords, popularity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            1000000,
-            json.dumps([
-                {"id": 28, "name": "Action"},
-                {"id": 10752, "name": "War"},
-            ]),
-            "",
             1,
-            json.dumps([]),
-            "en",
             "Dunkirk",
+            2017,
             "A wartime rescue mission.",
+            json.dumps(["Fionn Whitehead", "Harry Styles"]),
+            "Christopher Nolan",
+            json.dumps([]),
             7.4,
-            json.dumps([]),
-            json.dumps([]),
-            "2017-07-21",
-            500000000,
-            106.0,
-            json.dumps([{"iso_639_1": "en", "name": "English"}]),
-            "Released",
-            "Nothing can prepare you for this.",
-            "Dunkirk",
-            7.8,
-            5000,
         ),
     )
-
+    conn.executemany(
+        "INSERT INTO genres (movie_id, name) VALUES (?, ?)",
+        [(1, "Action"), (1, "War")],
+    )
     conn.execute(
-        """
-        INSERT INTO credits (movie_id, title, cast, crew)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            1,
-            "Dunkirk",
-            json.dumps([]),
-            json.dumps([
-                {"id": 1, "name": "Christopher Nolan", "job": "Director"},
-                {"id": 2, "name": "Christopher Nolan", "job": "Writer"},
-            ]),
-        ),
+        "INSERT INTO ratings (movie_id, vote_average, vote_count) VALUES (?, ?, ?)",
+        (1, 7.8, 5000),
     )
 
     conn.commit()
@@ -76,10 +50,11 @@ def test_repository_filters_title_genre_director_year_and_sorts(tmp_path):
     result = repo.search(
         MovieQuery(
             intent="search",
-            title="Dunkirk",
-            genre="War",
-            director="Christopher Nolan",
+            title="dUnKiRk",
+            genre="wAr",
+            director="nOlAn",
             year=2017,
+            keywords=["rescue"],
             sort_by="rating",
             limit=5,
         )
@@ -88,18 +63,108 @@ def test_repository_filters_title_genre_director_year_and_sorts(tmp_path):
     assert len(result) == 1
     assert result[0].title == "Dunkirk"
     assert result[0].director == "Christopher Nolan"
-    assert "War" in result[0].genres
+    assert set(result[0].genres) == {"Action", "War"}
     assert result[0].release_year == 2017
+    assert result[0].rating == 7.8
+    assert result[0].cast == ["Fionn Whitehead", "Harry Styles"]
 
 
-def test_repository_limits_results(tmp_path):
+def test_multiple_genres_do_not_duplicate_movies(tmp_path):
     db_path = tmp_path / "movies.db"
     _seed_db(db_path)
 
+    result = MovieRepository(db_path).search(MovieQuery(intent="search"))
+
+    assert [movie.id for movie in result] == [1]
+    assert set(result[0].genres) == {"Action", "War"}
+
+
+def test_movies_without_ratings_or_genres_are_returned_without_explicit_sort(tmp_path):
+    db_path = tmp_path / "movies.db"
+    _seed_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO movies (id, title) VALUES (?, ?)", (2, "Unrated"))
+
     repo = MovieRepository(db_path)
-    result = repo.search(MovieQuery(intent="search", limit=1))
+    result = repo.search(MovieQuery(intent="search", title="Unrated"))
 
     assert len(result) == 1
+    assert result[0].rating is None
+    assert result[0].genres == []
+    assert result[0].cast == []
+    assert result[0].keywords == []
+    assert repo.search(MovieQuery(intent="search", title="Unrated", sort_by="rating")) == []
+
+
+@pytest.mark.parametrize("limit, expected_count", [(None, 20), (1, 1), (50, 50)])
+def test_repository_limits_results(tmp_path, limit, expected_count):
+    db_path = tmp_path / "movies.db"
+    _seed_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO movies (id, title) VALUES (?, ?)",
+            [(movie_id, f"Movie {movie_id}") for movie_id in range(2, 61)],
+        )
+
+    repo = MovieRepository(db_path)
+    query = MovieQuery(intent="search") if limit is None else MovieQuery(intent="search", limit=limit)
+    result = repo.search(query)
+
+    assert len(result) == expected_count
+
+
+@pytest.mark.parametrize(
+    ("keywords", "genre", "limit", "expected_titles"),
+    [
+        (["  ChRiStMaS  "], None, 20, ["Holiday Drama", "Winter Comedy", "Family Reunion"]),
+        (["christmas", "easter"], "Comedy", 20, ["Winter Comedy", "Spring Comedy", "Family Reunion"]),
+        (["christmas"], "Comedy", 1, ["Winter Comedy"]),
+        ([], "Comedy", 1, ["Popular Summer Comedy"]),
+        (["missing"], None, 20, []),
+        (["%"], None, 20, ["Literal Symbols"]),
+        (["_"], None, 20, ["Literal Symbols"]),
+        (["!"], None, 20, ["Literal Symbols"]),
+        (["%' OR 1=1 --"], None, 20, []),
+        (["999"], None, 20, []),
+    ],
+)
+def test_keyword_search_matches_overview_or_metadata_with_other_filters(
+    tmp_path, keywords, genre, limit, expected_titles
+):
+    db_path = tmp_path / "movies.db"
+    _seed_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany(
+            "INSERT INTO movies (id, title, overview, keywords, popularity) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (2, "Winter Comedy", "A Christmas adventure.", "[]", 20),
+                (3, "Family Reunion", None, '["christmas"]', 10),
+                (4, "Holiday Drama", "A family gathering.", '["christmas"]', 30),
+                (5, "Spring Comedy", "An Easter adventure.", "[]", 15),
+                (6, "Popular Summer Comedy", "Friends visit a beach.", "[]", 1000),
+                (7, "Literal Symbols", "100% fun with an_under_score!", "[]", 5),
+                (8, "Missing Overview", None, "[]", 50),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO genres (movie_id, name) VALUES (?, ?)",
+            [(2, "Comedy"), (3, "Comedy"), (4, "Drama"), (5, "Comedy"),
+             (6, "Comedy"), (7, "Comedy"), (8, "Comedy")],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    results = MovieRepository(db_path).search(
+        MovieQuery(intent="recommend", keywords=keywords, genre=genre, limit=limit)
+    )
+
+    assert [movie.title for movie in results] == expected_titles
+    for movie in results:
+        if movie.title == "Family Reunion":
+            assert movie.keywords == ["christmas"]
 
 
 @pytest.mark.parametrize(
@@ -118,12 +183,15 @@ def test_vote_threshold_applies_only_with_explicit_sort(
     conn = sqlite3.connect(db_path)
     try:
         conn.executemany(
-            "INSERT INTO movies (id, title, vote_count, vote_average, popularity) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO movies (id, title, popularity) VALUES (?, ?, ?)",
             [
-                (2, "Low vote movie", 49, 10.0, 100.0),
-                (3, "Boundary movie", 50, 7.0, 20.0),
+                (2, "Low vote movie", 100.0),
+                (3, "Boundary movie", 20.0),
             ],
+        )
+        conn.executemany(
+            "INSERT INTO ratings (movie_id, vote_count, vote_average) VALUES (?, ?, ?)",
+            [(2, 49, 10.0), (3, 50, 7.0)],
         )
         conn.commit()
     finally:

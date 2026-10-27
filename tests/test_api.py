@@ -10,7 +10,10 @@ def test_search_returns_movies(monkeypatch):
     def fake_search(query):
         assert isinstance(query, MovieQuery)
         assert query.title == "Dunkirk"
-        return [MovieRecord(1, "Dunkirk", None, ["War"], "Christopher Nolan", 2017, 7.4, 7.8)]
+        return [MovieRecord(
+            1, "Dunkirk", None, ["War"], "Christopher Nolan", 2017, 7.4, 7.8,
+            cast=["Fionn Whitehead"],
+        )]
 
     monkeypatch.setattr(repository, "search", fake_search)
     with TestClient(app) as client:
@@ -22,11 +25,11 @@ def test_search_returns_movies(monkeypatch):
     assert response.json() == [
         {"id": 1, "title": "Dunkirk", "overview": None, "genres": ["War"],
          "director": "Christopher Nolan", "release_year": 2017,
-         "popularity": 7.4, "rating": 7.8}
+         "popularity": 7.4, "rating": 7.8, "keywords": [], "cast": ["Fionn Whitehead"]}
     ]
 
 
-@pytest.mark.parametrize("payload", [{}, {"intent": "search", "limit": 21}])
+@pytest.mark.parametrize("payload", [{}, {"intent": "search", "limit": 51}])
 def test_invalid_search_is_rejected_before_repository_call(monkeypatch, payload):
     def unexpected_search(query):
         pytest.fail("Invalid requests must not reach the repository")

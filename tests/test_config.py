@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from app import __main__ as cli
+from app import main as cli
 from app.model_config import LLMConfig
 from app.main import create_app, get_llm_client
 from app.query_parser import generate_answer, parse_query
@@ -14,8 +14,8 @@ from huggingface_hub import ChatCompletionOutput
 
 
 def test_local_is_default_even_with_hosted_credentials(monkeypatch):
-    monkeypatch.delenv("LLM_MODEL", raising=False)
-    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.setenv("HF_TOKEN", "hf_test_secret")
     monkeypatch.setenv("HF_MODEL", "example/hosted-model")
     config = LLMConfig.from_env()
@@ -46,11 +46,11 @@ def test_api_config_is_immutable_and_does_not_expose_token(monkeypatch):
 
 
 def test_configuration_is_fixed_until_restart(monkeypatch):
-    monkeypatch.setenv("LLM_MODEL", "original-model")
+    monkeypatch.setenv("OLLAMA_MODEL", "original-model")
     application = create_app()
     with TestClient(application):
         original_config = application.state.llm_config
-        monkeypatch.setenv("LLM_MODEL", "changed-model")
+        monkeypatch.setenv("OLLAMA_MODEL", "changed-model")
         assert application.state.llm_config is original_config
         assert application.state.llm_config.model == "original-model"
     with TestClient(application):
@@ -64,11 +64,12 @@ def test_api_client_uses_hosted_routing(monkeypatch):
     with contextmanager(get_llm_client)(config):
         pass
     constructor.assert_called_once_with(
-        base_url=None, provider="auto", token="hf_test", timeout=30.0,
+        base_url=None, provider="auto", token="hf_test", timeout=120.0,
     )
 
 
-def test_hosted_calls_use_selected_model_without_local_options(monkeypatch):
+@pytest.mark.parametrize("model", ["example/model", "Qwen/Qwen3.5-9B:fastest"])
+def test_hosted_calls_use_selected_model_and_short_answers(monkeypatch, model):
     # Actual SDK output objects, with no network calls or provider lookup.
     client = Mock()
     client.chat_completion.return_value = ChatCompletionOutput.parse_obj_as_instance({
@@ -76,20 +77,24 @@ def test_hosted_calls_use_selected_model_without_local_options(monkeypatch):
                      "message": {"role": "assistant", "content": '{"query": null}'}}],
         "created": 0, "id": "test", "model": "example/model",
     })
-    config = LLMConfig(mode="api", model="example/model", base_url=None, token="hf_test")
-    monkeypatch.setenv("LLM_MODEL", "must-not-be-read")
+    config = LLMConfig(mode="api", model=model, base_url=None, token="hf_test")
+    monkeypatch.setenv("OLLAMA_MODEL", "must-not-be-read")
     assert parse_query(client, "A question", [], config) is None
     generate_answer(client, "A question", [], [], config)
     for call in client.chat_completion.call_args_list:
-        assert call.kwargs["model"] == "example/model"
-        assert call.kwargs["extra_body"] is None
+        assert call.kwargs["model"] == model
+    parse_call, answer_call = client.chat_completion.call_args_list
+    assert parse_call.kwargs["extra_body"] is None
+    assert answer_call.kwargs["extra_body"] == {"reasoning_effort": "none"}
+    assert answer_call.kwargs["max_tokens"] == 2048
+    assert "at most three sentences" in answer_call.kwargs["messages"][0]["content"]
 
 
 @pytest.mark.parametrize("arguments, expected_mode", [([], "local"), (["--API"], "api")])
 def test_launcher_selects_mode_once(monkeypatch, arguments, expected_mode):
     monkeypatch.setenv("HF_TOKEN", "hf_test")
     monkeypatch.setenv("HF_MODEL", "example/model")
-    monkeypatch.setattr(sys, "argv", ["app", *arguments])
+    monkeypatch.setattr(sys, "argv", ["app.main", *arguments])
     started = []
 
     def fake_run(application, **kwargs):
@@ -104,7 +109,7 @@ def test_launcher_selects_mode_once(monkeypatch, arguments, expected_mode):
 
 def test_launcher_rejects_unconfigured_api_before_starting(monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.setattr(sys, "argv", ["app", "--API"])
+    monkeypatch.setattr(sys, "argv", ["app.main", "--API"])
     server = Mock()
     monkeypatch.setattr(cli.uvicorn, "run", server)
     with pytest.raises(SystemExit) as exc:
