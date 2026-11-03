@@ -7,10 +7,16 @@ class MovieQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     intent: Literal["details", "recommend", "search"]
-    title: str | None = None
+    title: str | None = Field(
+        default=None,
+        description="Movie title filter."
+    )
     genre: str | None = None
     director: str | None = None
-    cast: str | None = None
+    cast: str | None = Field(
+        default=None,
+        description="One actor name to find movies featuring that actor. "
+    )
     year: int | None = None
     keywords: list[
         Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]

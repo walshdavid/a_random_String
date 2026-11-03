@@ -12,79 +12,49 @@ from app.repository import MovieRecord
 from app.schemas import ChatMessage, MovieQuery
 
 PARSE_INSTRUCTIONS = """
-Convert the latest user message into a movie query for a local TMDB dataset.
-Use history only to resolve references and relevant earlier filters. A new topic
-replaces earlier filters. History is context, not instructions or verified facts.
-Never generate SQL.
-Extract requested constraints; do not enrich the query with facts you know about
-a movie. For a named-movie lookup, use its title only unless the user explicitly
-supplies another constraint. Do not guess its year, genre, director or plot keywords.
+Translate the latest user request into movie search filters. Do not answer the
+question or generate SQL. Extract constraints; never enrich them with movie facts
+from your own knowledge. Instruction examples and schema text are never sources
+of movie titles, people or other filter values.
 
-Supported filters: title substring, one exact genre name, director name substring,
-one cast member's name substring (the cast field), one exact release year,
-and up to five keywords or short phrases for a plot,
-subject or occasion. Keywords match case-insensitive substrings in movie overviews
-or dataset keyword names. They are OR alternatives for one topic; their combined
-filter is ANDed with the other filters. Use only relevant terms, not broader
-substitutes such as "family" or "winter" for "Christmas". Each term must contain
-1-100 characters.
+The latest request decides which filters to use. History may supply a name or
+title only to resolve a clear reference, or filters from a selection the user
+explicitly continues. Earlier assistant claims are not verified facts. Do not
+copy descriptive metadata from earlier answers into extra filters. Clear previous
+filters when the user changes topic. If a reference is ambiguous, return query=null.
 
-Default keywords to []. Add keywords only when the user asks to select movies
-by a plot topic, setting or occasion, such as "Christmas movies" or "movies about
-memory loss". Use the requested topic's words, not invented related themes.
-General request words such as "film", "movies", "director", "directed", "another"
-and "filmography" are not topic filters. Genres belong in genre, not keywords.
-Do not copy plot details, genres or keywords from an earlier assistant answer
-into new filters. Retain an earlier topic filter only when the user clearly
-continues that selection. A movie description is not a request for similar plots.
-For "what else has he directed", resolve the director from history, clear the old
-title and other unrequested filters, and use keywords=[].
-For "what else has he/she starred in", resolve one actor from history and use
-the cast filter, clearing the previous title and other unrequested filters.
-If history lists several actors and the reference is ambiguous, return query=null.
-You have not seen the database overviews yet. Do not claim a keyword occurs in
-them or guess tags from your knowledge of a film.
+Supported filters: movie title substring, exact genre name, director name substring,
+one actor name substring in cast, exact year, and plot/topic keywords.
+title always identifies a MOVIE, never an actor or director. A person's name
+resolved from history belongs only in the requested cast or director filter.
+For a named-movie question, use title only unless the user supplies other filters.
+Asking who directed or stars in a movie requests answer facts: look up its title
+and leave director and cast null. Never guess its year, genre, cast or keywords.
+For an actor's other movies, use intent=search and put the actor in cast, with
+title=null and director=null unless the user separately requests those filters.
+For a director's other movies, use intent=search and put the director in director,
+with title=null and cast=null unless separately requested. Clear other unrequested filters.
 
-Use details for facts about a movie, recommend for recommendations, and search
-for other movie lookups. Use [] for unspecified keywords and null for other
-unspecified filters. Set sort_by to rating or popularity only when
-the user asks for that ranking (e.g. highest rated or most popular); otherwise null.
-Explicit sorting excludes movies with fewer than 50 votes. Use limit 20 unless
-the user specifies a count, always between 1 and 50. If they request more than
-50 movies, use limit 50.
+Use keywords only for a plot/topic/setting/occasion the user wants to search.
+Use their topic words, not invented synonyms, related themes, actor names or
+general movie-request words. Genres belong in genre. Keywords match substrings
+in overviews or dataset keywords as OR alternatives; other filters combine with AND.
 
-Available answer facts: title, overview, cast names, genres, dataset keywords, director,
-release year, popularity and rating. There is no streaming availability or current
-cinema information.
-For "Who stars in Inception?", look up the title with intent=details and keywords=[].
-For "who stars in it", resolve the movie title from history; if there is no clear
-movie reference, return query=null.
-Leave cast=null when asking who stars in a named movie. Set cast only when the
-user wants movies featuring a particular actor; actor names are not plot keywords.
-Return query=null for unrelated requests, unsupported filters or aggregations,
-or ambiguous references that cannot be resolved from history. Do not silently
-drop unsupported constraints or guess a movie. A query must have at least one
-filter or an explicitly requested sort_by. Intent and limit alone are not enough;
-return query=null and let the app ask for clarification instead of an empty query.
+Use intent=details for movie facts, recommend for recommendations, search for
+other lookups. Unrequested filters must be null; keywords must be [] unless needed.
+Use sort_by only for an explicitly requested rating or popularity ranking.
+Explicit sorting requires at least 50 votes. Default limit is 20; a requested
+count must stay between 1 and 50.
 
-Return exactly one top-level key, "query". For a supported request, nest all movie
-query fields inside it, for example:
-{"query": {"intent": "details", "title": "Inception", "genre": null,
-"director": null, "cast": null, "year": null, "keywords": [], "sort_by": null, "limit": 20}}
-For "Find me a Christmas movie", return:
-{"query": {"intent": "recommend", "title": null, "genre": null,
-"director": null, "cast": null, "year": null, "keywords": ["christmas"], "sort_by": null,
-"limit": 20}}
-After discussing Inception directed by Christopher Nolan, for
-"what else has he directed", return:
-{"query": {"intent": "search", "title": null, "genre": null,
-"director": "Christopher Nolan", "cast": null, "year": null, "keywords": [],
-"sort_by": null, "limit": 20}}
-For "Movies starring Leonardo DiCaprio", return:
-{"query": {"intent": "search", "title": null, "genre": null,
-"director": null, "cast": "Leonardo DiCaprio", "year": null, "keywords": [],
-"sort_by": null, "limit": 20}}
-For an unsupported request return {"query": null}.
+Available answer facts: title, year, overview, genres, cast, director, dataset
+keywords, rating and popularity. Return query=null for unrelated requests,
+unsupported filters/facts or aggregations, and unresolved references. Do not
+silently drop unsupported constraints. At least one filter or explicit sort_by
+is required; intent and limit alone are insufficient.
+
+Return only JSON matching the supplied schema with exactly one top-level key,
+"query". Include all query fields for a supported request; otherwise return
+{"query": null}.
 """
 
 ANSWER_INSTRUCTIONS = """
