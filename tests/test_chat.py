@@ -119,7 +119,7 @@ def test_chat_resolves_history_retrieves_movies_and_generates_answer(chat_client
     assert all(request["stream"] is False for request in requests)
     assert "MovieQuery" in requests[0]["format"]["$defs"]
     assert requests[1]["format"]["required"] == ["answer"]
-    assert all(request["options"]["temperature"] == 0.7 for request in requests)
+    assert all(request["options"]["temperature"] == 0.0 for request in requests)
     assert all(request["options"]["top_p"] == 0.8 for request in requests)
     assert '"MovieQuery"' in requests[0]["messages"][0]["content"]
 
