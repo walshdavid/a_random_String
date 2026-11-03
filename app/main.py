@@ -189,7 +189,7 @@ def movie_chat(
             ChatMessage(role="user", content=request.message),
             ChatMessage(role="assistant", content=answer[:2000]),
         ])[-10:]
-        logger.info("Answer: %s", json.dumps(answer))
+        logger.info("Answer: %s \n", json.dumps(answer))
         return response
 
 

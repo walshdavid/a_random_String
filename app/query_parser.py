@@ -12,49 +12,48 @@ from app.repository import MovieRecord
 from app.schemas import ChatMessage, MovieQuery
 
 PARSE_INSTRUCTIONS = """
-Translate the latest user request into movie search filters. Do not answer the
-question or generate SQL. Extract constraints; never enrich them with movie facts
-from your own knowledge. Instruction examples and schema text are never sources
-of movie titles, people or other filter values.
+Extract movie search filters from the latest user message. Do not answer it,
+generate SQL, invent movie matches or add facts from your own knowledge.
+Return only JSON with one key, "query": all fields below, or null.
 
-The latest request decides which filters to use. History may supply a name or
-title only to resolve a clear reference, or filters from a selection the user
-explicitly continues. Earlier assistant claims are not verified facts. Do not
-copy descriptive metadata from earlier answers into extra filters. Clear previous
-filters when the user changes topic. If a reference is ambiguous, return query=null.
+Field definitions:
+- intent: "details" for facts about a movie, "recommend" for recommendations,
+  "search" for matching movies, including an actor's or director's other movies.
+- title: a MOVIE TITLE substring, never a person's name.
+- genre: one exact genre name requested by the user.
+- director: one person's name substring, selecting movies they directed.
+- cast: ONE ACTOR'S name substring, selecting movies featuring that actor.
+  It is not a movie title, a list of actors or the answer to a cast question.
+- year: an exact release year explicitly requested by the user.
+- keywords: up to five requested plot/topic/setting/occasion terms. Use the user's
+  words, not invented themes, genres, people or general movie-request words.
+- sort_by: "rating" or "popularity" only when that ranking is requested.
+  Explicit ranking excludes movies with fewer than 50 votes.
+- limit: requested result count, clamped to 1-50; default 20.
 
-Supported filters: movie title substring, exact genre name, director name substring,
-one actor name substring in cast, exact year, and plot/topic keywords.
-title always identifies a MOVIE, never an actor or director. A person's name
-resolved from history belongs only in the requested cast or director filter.
-For a named-movie question, use title only unless the user supplies other filters.
-Asking who directed or stars in a movie requests answer facts: look up its title
-and leave director and cast null. Never guess its year, genre, cast or keywords.
-For an actor's other movies, use intent=search and put the actor in cast, with
-title=null and director=null unless the user separately requests those filters.
-For a director's other movies, use intent=search and put the director in director,
-with title=null and cast=null unless separately requested. Clear other unrequested filters.
+Routing rules:
+- Asking what a person "is in", "appears in" or "stars in" selects cast and
+  intent="search"; title=null unless a movie is also specified. The user need
+  not say the word "actor".
+- Asking for movies directed by a person selects director, with title=null.
+- Asking for a movie's cast, director or plot selects its title;
+  cast and director stay null because those are requested answers, not filters.
+- Only combine title with a person filter when the user explicitly supplies both.
+- Use previously retrieved movie facts to resolve references in
+  follow-up questions, including movie titles, actors and directors.
+- Do not copy unrelated information, examples or unverified claims
+  from earlier assistant responses into filters.
 
-Use keywords only for a plot/topic/setting/occasion the user wants to search.
-Use their topic words, not invented synonyms, related themes, actor names or
-general movie-request words. Genres belong in genre. Keywords match substrings
-in overviews or dataset keywords as OR alternatives; other filters combine with AND.
+Use history only to resolve clear references or explicitly continued selections.
+When asking for a person's other movies, clear the previous movie title and
+unrequested filters. If the person is ambiguous, return query=null. 
+A named-movie lookup must not gain a guessed year, genre or keywords.
+Leave unrequested filters null and keywords=[]; no extra fields are allowed.
+Keywords are OR alternatives; other filters combine with AND.
 
-Use intent=details for movie facts, recommend for recommendations, search for
-other lookups. Unrequested filters must be null; keywords must be [] unless needed.
-Use sort_by only for an explicitly requested rating or popularity ranking.
-Explicit sorting requires at least 50 votes. Default limit is 20; a requested
-count must stay between 1 and 50.
-
-Available answer facts: title, year, overview, genres, cast, director, dataset
-keywords, rating and popularity. Return query=null for unrelated requests,
-unsupported filters/facts or aggregations, and unresolved references. Do not
-silently drop unsupported constraints. At least one filter or explicit sort_by
-is required; intent and limit alone are insufficient.
-
-Return only JSON matching the supplied schema with exactly one top-level key,
-"query". Include all query fields for a supported request; otherwise return
-{"query": null}.
+Available movie facts: title, year, plot, genres, cast, director, dataset keywords,
+rating and popularity. Return query=null for unsupported requests or constraints,
+aggregations, unresolved references, or no filters and no explicit sort_by.
 """
 
 ANSWER_INSTRUCTIONS = """
@@ -194,8 +193,7 @@ def parse_query(
         _messages(instructions, message, history),
         schema=schema,
         max_tokens=512,
-        # Qwen recommends sampling, rather than greedy decoding, to avoid loops.
-        temperature=0.7 if config.mode == "local" else 0.0,
+        temperature=0.0 if config.mode == "local" else 0.0,
     )
     data = json.loads(content)
     # Small models may omit the wrapper; accept only a fully valid MovieQuery.
