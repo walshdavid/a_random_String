@@ -59,7 +59,7 @@ ollama serve
 Download the default model:
 
 ```bash
-ollama pull gemma3:4b
+ollama pull qwen3:4b
 ```
 
 Start the app using your chosen setup:
@@ -73,7 +73,7 @@ python -m app.main
 ```
 
 To use another installed model, set `OLLAMA_MODEL` before starting the app,
-for example `export OLLAMA_MODEL='qwen3:4b'`.
+for example `export OLLAMA_MODEL='gemma3:4b'`.
 
 With both CSV files present and Ollama running, `bash setup.sh` automates the pip
 setup, tests, database rebuild, selected model download and local startup.
