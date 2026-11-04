@@ -273,8 +273,7 @@ Repeated messages were not identical model inputs. Each repeat included more
 history, including earlier no-match or clarification replies. Repeating inside
 one conversation therefore mixes two factors: changed context and new generation.
 
-The current local parser uses temperature=0.7, so sampling can also contribute
-variation. The hosted parser currently requests temperature=0.0. The log does not
+The local parser currently requests temperature=0.0. The log does not
 record the runtime model, provider or sampling settings, so it cannot establish
 which setting caused a particular output. Repetition is not model training.
 
